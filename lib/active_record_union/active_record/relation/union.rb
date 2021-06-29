@@ -18,27 +18,24 @@ module ActiveRecord
       private
 
       def set_operation(operation, relation_or_where_arg, *args)
-        other = if args.empty? && relation_or_where_arg.is_a?(Relation)
-                  relation_or_where_arg
+        others = if args.empty? && relation_or_where_arg.is_a?(Relation)
+                  [relation_or_where_arg, *args]
                 else
-                  @klass.where(relation_or_where_arg, *args)
+                  [@klass.where(relation_or_where_arg, *args)]
                 end
 
-        verify_relations_for_set_operation!(operation, self, other)
+        verify_relations_for_set_operation!(operation, self, *others)
 
-        left = self.arel.ast
-        right = other.arel.ast
+        queries = if Arel::Visitors::SQLite === self.connection.visitor
+                    [self.arel.ast, *others.map{|other| other.arel.ast}]
+                  else
+                    [Arel::Nodes::Grouping.new(self.arel.ast), *others.map { |other| Arel::Nodes::Grouping.new(other.arel.ast) }]
+                  end
 
-        # Postgres allows ORDER BY in the UNION subqueries if each subquery is surrounded by parenthesis
-        # but SQLite does not allow parens around the subqueries
-        unless self.connection.visitor.is_a?(Arel::Visitors::SQLite)
-          left = Arel::Nodes::Grouping.new(left)
-          right = Arel::Nodes::Grouping.new(right)
-        end
-
-        set  = SET_OPERATION_TO_AREL_CLASS[operation].new(left, right)
+        arel_class = SET_OPERATION_TO_AREL_CLASS[operation]
+        set = queries.reduce { |left, right| arel_class.new(left, right) }
         from = Arel::Nodes::TableAlias.new(set, @klass.arel_table.name)
-        build_union_relation(from, other)
+        build_union_relation(from, others)
       end
 
       if ActiveRecord.gem_version >= Gem::Version.new('5.2.0.beta2')
@@ -49,11 +46,14 @@ module ActiveRecord
       elsif ActiveRecord::VERSION::MAJOR >= 5
         # In Rails >= 5.0, < 5.2, binds are maintained only in ActiveRecord
         # relations and clauses.
-        def build_union_relation(arel_table_alias, other)
+        def build_union_relation(arel_table_alias, others)
           relation = @klass.unscoped.spawn
+          # relation.from_clause =
+          #   UnionFromClause.new(arel_table_alias, nil,
+          #                       self.bound_attributes + other.bound_attributes)
           relation.from_clause =
             UnionFromClause.new(arel_table_alias, nil,
-                                self.bound_attributes + other.bound_attributes)
+                                self.bound_attributes + others.sum([], &:bound_attributes))
           relation
         end
 
